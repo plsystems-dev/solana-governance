@@ -1,7 +1,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use anchor_client::{
-    Program,
+    DynSigner, Program,
     solana_sdk::{signature::Keypair, signer::Signer},
 };
 use anchor_lang::{prelude::Pubkey, system_program};
@@ -81,7 +81,7 @@ fn validate_config_values(
 /// errors when a mismatch can be positively determined; otherwise it defers to the
 /// on-chain constraint.
 async fn ensure_upgrade_authority(
-    program: &Program<Arc<Keypair>>,
+    program: &Program<Arc<DynSigner>>,
     program_data: &Pubkey,
     signer: &Pubkey,
 ) -> Result<()> {
@@ -346,7 +346,7 @@ pub async fn accept_admin(
 }
 
 pub async fn show_global_config(rpc_url: Option<String>) -> Result<()> {
-    let mock_payer = Arc::new(Keypair::new());
+    let mock_payer = Arc::new(DynSigner(Arc::new(Keypair::new())));
     let program = anchor_client_setup(rpc_url, mock_payer)?;
 
     let config = fetch_global_config(&program).await?;
