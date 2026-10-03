@@ -680,16 +680,29 @@ async fn handle_command(cli: Cli) -> Result<()> {
 
     // Resolve only commands that submit Squads transactions. Read-only commands
     // and local configuration commands do not need a multisig lookup.
-    let squads_opts = match (&cli.command, cli.squads) {
-        (
-            Commands::CastVoteOverride { .. }
-            | Commands::ModifyVoteOverride { .. }
-            | Commands::InitGlobalConfig { .. }
-            | Commands::UpdateGlobalConfig { .. }
-            | Commands::NominateAdmin { .. }
-            | Commands::AcceptAdmin,
-            Some(address),
-        ) => {
+    // Keep this exhaustive so new commands require an explicit routing decision.
+    let squads_address = match &cli.command {
+        Commands::CastVoteOverride { .. }
+        | Commands::ModifyVoteOverride { .. }
+        | Commands::InitGlobalConfig { .. }
+        | Commands::UpdateGlobalConfig { .. }
+        | Commands::NominateAdmin { .. }
+        | Commands::AcceptAdmin => cli.squads,
+        Commands::CreateProposal { .. }
+        | Commands::SupportProposal { .. }
+        | Commands::CastVote { .. }
+        | Commands::ModifyVote { .. }
+        | Commands::InitIndex { .. }
+        | Commands::FinalizeProposal { .. }
+        | Commands::RetallySupport { .. }
+        | Commands::Proposal { .. }
+        | Commands::ListProposals { .. }
+        | Commands::ShowGlobalConfig
+        | Commands::Init
+        | Commands::Config { .. } => None,
+    };
+    let squads_opts = match squads_address {
+        Some(address) => {
             let rpc = RpcClient::new(
                 cli.rpc_url
                     .clone()
@@ -709,7 +722,7 @@ async fn handle_command(cli: Cli) -> Result<()> {
                 memo: cli.squads_memo.clone(),
             })
         }
-        _ => None,
+        None => None,
     };
 
     match &cli.command {

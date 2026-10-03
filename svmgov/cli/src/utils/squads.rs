@@ -33,7 +33,7 @@ use anchor_client::solana_sdk::{
     signature::{Signature, Signer},
     transaction::Transaction,
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use squads_client::{Multisig, SquadsClient, SquadsError};
 
@@ -112,18 +112,6 @@ pub async fn resolve_multisig(
             "No Squads multisig found for vault {address} at vault index {vault_index} under program {program_id}"
         ))?;
 
-    let account = rpc
-        .get_account_with_commitment(&multisig, commitment)
-        .await
-        .with_context(|| format!("Failed to fetch resolved Squads multisig {multisig}"))?
-        .value
-        .ok_or_else(|| anyhow!("Resolved Squads multisig {multisig} no longer exists"))?;
-    ensure!(
-        account.owner == program_id,
-        "Resolved multisig {multisig} is not owned by Squads program {program_id}"
-    );
-    Multisig::try_deserialize(&account.data)
-        .with_context(|| format!("Resolved account {multisig} is not a valid Squads multisig"))?;
     log::info!(
         "Resolved Squads vault {address} to multisig {multisig} (vault index {vault_index})"
     );
@@ -643,7 +631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_canonical_vault_with_filtered_program_scan() {
+    async fn resolves_canonical_vault_with_two_rpc_calls() {
         let vault = "FQC6LwQSEPNEX7MrFJXSqty46r4wxA9iJdsqpzVsv8aD"
             .parse()
             .unwrap();
@@ -653,7 +641,6 @@ mod tests {
         let rpc = ResolverRpc::new(vec![
             account_response(Some(rpc_account(Pubkey::default(), &[]))),
             program_accounts_response(PROGRAM_ID, &[Pubkey::new_unique(), multisig]),
-            account_response(Some(multisig_account(PROGRAM_ID))),
         ]);
 
         assert_eq!(
@@ -680,8 +667,7 @@ mod tests {
             filter.bytes().unwrap().as_slice(),
             Multisig::discriminator()
         );
-        assert_eq!(calls[2].1[0], multisig.to_string());
-        assert_eq!(calls[2].1[1]["commitment"], "confirmed");
+        assert_eq!(calls.len(), 2);
     }
 
     #[tokio::test]
@@ -692,7 +678,6 @@ mod tests {
         let rpc = ResolverRpc::new(vec![
             account_response(None),
             program_accounts_response(program_id, &[multisig]),
-            account_response(Some(multisig_account(program_id))),
         ]);
 
         assert_eq!(
@@ -711,7 +696,6 @@ mod tests {
         let rpc = ResolverRpc::new(vec![
             account_response(Some(rpc_account(PROGRAM_ID, &[]))),
             program_accounts_response(PROGRAM_ID, &[multisig]),
-            account_response(Some(multisig_account(PROGRAM_ID))),
         ]);
 
         assert_eq!(
@@ -720,7 +704,7 @@ mod tests {
                 .unwrap(),
             multisig
         );
-        assert_eq!(rpc.calls().len(), 3);
+        assert_eq!(rpc.calls().len(), 2);
     }
 
     #[tokio::test]
@@ -757,27 +741,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_multisig_must_have_valid_owner_and_data() {
+    async fn resolver_rejects_scan_candidate_owned_by_another_program() {
         let multisig = Pubkey::new_unique();
         let vault = squads_client::vault_pda(&multisig, 0, None).0;
-        for account in [
-            None,
-            Some(multisig_account(Pubkey::new_unique())),
-            Some(rpc_account(PROGRAM_ID, &[])),
-        ] {
-            let rpc = ResolverRpc::new(vec![
-                account_response(None),
-                program_accounts_response(PROGRAM_ID, &[multisig]),
-                account_response(account),
-            ]);
+        let rpc = ResolverRpc::new(vec![
+            account_response(None),
+            program_accounts_response(Pubkey::new_unique(), &[multisig]),
+        ]);
 
-            assert!(
-                resolve_multisig(&rpc.client(), vault, 0, None)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(rpc.calls().len(), 3);
-        }
+        let error = resolve_multisig(&rpc.client(), vault, 0, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("No Squads multisig found"),
+            "{error:#}"
+        );
+        assert_eq!(rpc.calls().len(), 2);
     }
 
     #[tokio::test]
