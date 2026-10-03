@@ -375,7 +375,8 @@ pub async fn route_or_send<R: RouterRpc + ?Sized>(
     }
 }
 
-/// Runs preflight and preserves its confirmed signature if the proposal step fails.
+/// Validates the proposal before preflight and reports confirmed preflight effects
+/// if a later proposal step fails.
 async fn route_via_squads<R: RouterRpc + ?Sized>(
     rpc: &R,
     vault_ixs: Vec<Instruction>,
@@ -383,87 +384,77 @@ async fn route_via_squads<R: RouterRpc + ?Sized>(
     signers: &[&dyn Signer],
     config: &SquadsRoutingConfig,
 ) -> Result<RoutedOutcome, SquadsError> {
-    let preflight_signature = if preflight_ixs.is_empty() {
-        None
-    } else {
-        Some(send_instructions(rpc, &preflight_ixs, signers).await?)
-    };
-
-    create_squads_proposal(rpc, vault_ixs, signers, config)
-        .await
-        .map_err(|err| match preflight_signature {
-            Some(signature) => SquadsError::SendTransaction {
-                reason: format!(
-                    "preflight transaction {signature} was confirmed and remains on-chain; \
-                     Squads proposal step failed: {err}"
-                ),
-            },
-            None => err,
-        })
-}
-
-/// Builds and submits the Squads proposal, retrying on transaction-index collisions.
-async fn create_squads_proposal<R: RouterRpc + ?Sized>(
-    rpc: &R,
-    vault_ixs: Vec<Instruction>,
-    signers: &[&dyn Signer],
-    config: &SquadsRoutingConfig,
-) -> Result<RoutedOutcome, SquadsError> {
     let squads = match config.program_id {
         Some(program_id) => SquadsClient::with_program_id(program_id),
         None => SquadsClient::new(),
     };
+    let mut preflight_signature = None;
 
-    // Build + submit, retrying with a freshly-fetched index on "already in use"
-    //    collisions.
-    let mut attempt: u8 = 0;
-    loop {
-        attempt += 1;
+    let result = async {
+        let mut attempt: u8 = 0;
+        loop {
+            attempt += 1;
 
-        let multisig_data = rpc.fetch_account_data(&config.multisig).await?;
-        let multisig = Multisig::try_deserialize(&multisig_data)?;
+            let multisig_data = rpc.fetch_account_data(&config.multisig).await?;
+            let multisig = Multisig::try_deserialize(&multisig_data)?;
+            squads.verify_proposer(&config.multisig, &multisig, &config.proposer)?;
 
-        squads.verify_proposer(&config.multisig, &multisig, &config.proposer)?;
+            let built = squads.build_vault_tx_with_proposal(
+                &config.multisig,
+                multisig.transaction_index,
+                config.vault_index,
+                &config.proposer,
+                &config.proposer,
+                &vault_ixs,
+                &[],
+                config.memo.clone(),
+            )?;
 
-        let built = squads.build_vault_tx_with_proposal(
-            &config.multisig,
-            multisig.transaction_index,
-            config.vault_index,
-            &config.proposer,
-            &config.proposer,
-            &vault_ixs,
-            &[],
-            config.memo.clone(),
-        )?;
-
-        match send_instructions(rpc, &built.instructions, signers).await {
-            Ok(creation_signature) => {
-                let (vault, _) = squads.pda_vault(&config.multisig, config.vault_index);
-                return Ok(RoutedOutcome::Squads {
-                    multisig: config.multisig,
-                    vault,
-                    transaction_index: built.transaction_index,
-                    vault_transaction_pda: built.transaction,
-                    proposal_pda: built.proposal,
-                    creation_signature,
-                    threshold: multisig.threshold,
-                    total_members: multisig.members.len(),
-                    web_url: squads_transaction_url(&config.multisig, built.transaction_index),
-                });
+            // Validate and build before committing any preflight work. Preflight
+            // is sent only once, even if the proposal's index needs a retry.
+            if attempt == 1 && !preflight_ixs.is_empty() {
+                preflight_signature = Some(send_instructions(rpc, &preflight_ixs, signers).await?);
             }
-            Err(SquadsError::SendTransaction { reason }) if is_account_collision(&reason) => {
-                if attempt >= MAX_INDEX_ATTEMPTS {
-                    return Err(SquadsError::TransactionIndexRace {
+
+            match send_instructions(rpc, &built.instructions, signers).await {
+                Ok(creation_signature) => {
+                    let (vault, _) = squads.pda_vault(&config.multisig, config.vault_index);
+                    return Ok(RoutedOutcome::Squads {
                         multisig: config.multisig,
-                        attempts: MAX_INDEX_ATTEMPTS,
+                        vault,
+                        transaction_index: built.transaction_index,
+                        vault_transaction_pda: built.transaction,
+                        proposal_pda: built.proposal,
+                        creation_signature,
+                        threshold: multisig.threshold,
+                        total_members: multisig.members.len(),
+                        web_url: squads_transaction_url(&config.multisig, built.transaction_index),
                     });
                 }
-                // Loop: re-fetch the multisig (its transaction_index will have advanced)
-                // and retry with the next free index.
+                Err(SquadsError::SendTransaction { reason }) if is_account_collision(&reason) => {
+                    if attempt >= MAX_INDEX_ATTEMPTS {
+                        return Err(SquadsError::TransactionIndexRace {
+                            multisig: config.multisig,
+                            attempts: MAX_INDEX_ATTEMPTS,
+                        });
+                    }
+                    // Re-fetch and validate the multisig before retrying with a new index.
+                }
+                Err(other) => return Err(other),
             }
-            Err(other) => return Err(other),
         }
     }
+    .await;
+
+    result.map_err(|err| match preflight_signature {
+        Some(signature) => SquadsError::SendTransaction {
+            reason: format!(
+                "preflight transaction {signature} was confirmed and remains on-chain; \
+                 Squads proposal step failed: {err}"
+            ),
+        },
+        None => err,
+    })
 }
 
 /// Signs `instructions` with `signers` (treating `signers[0]` as the fee payer) against a
@@ -779,6 +770,48 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(rpc.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scanned_invalid_multisig_is_rejected_before_preflight() {
+        let signer = InteractiveSigner {
+            keypair: Keypair::new(),
+            reject_on: None,
+            attempts: Cell::new(0),
+        };
+        let multisig = Pubkey::new_unique();
+        let vault = squads_client::vault_pda(&multisig, 0, None).0;
+        let mock = ResolverRpc::new(vec![
+            account_response(Some(rpc_account(Pubkey::default(), &[]))),
+            program_accounts_response(PROGRAM_ID, &[multisig]),
+            account_response(Some(rpc_account(PROGRAM_ID, &Multisig::discriminator()))),
+        ]);
+        let rpc = mock.client();
+        let resolved = resolve_multisig(&rpc, vault, 0, None).await.unwrap();
+        let config = SquadsRoutingConfig {
+            multisig: resolved,
+            vault_index: 0,
+            proposer: signer.pubkey(),
+            program_id: None,
+            memo: None,
+        };
+
+        let error = route_or_send(
+            &rpc,
+            vec![user_instruction(vec![2])],
+            vec![user_instruction(vec![1])],
+            &[&signer],
+            Some(&config),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, SquadsError::BorshDecode(_)), "{error}");
+        assert_eq!(signer.attempts.get(), 0);
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, RpcRequest::GetAccountInfo);
+        assert_eq!(calls[2].1[0], multisig.to_string());
     }
 
     // ----- Router orchestration tests (mock RPC) -----
@@ -1260,19 +1293,20 @@ mod tests {
             memo: None,
         };
 
-        let err = route_or_send(
-            &mock,
-            vec![user_instruction(vec![7])],
-            vec![],
-            &[&proposer],
-            Some(&config),
-        )
-        .await
-        .unwrap_err();
+        for preflight_ixs in [vec![], vec![user_instruction(vec![1])]] {
+            let err = route_or_send(
+                &mock,
+                vec![user_instruction(vec![7])],
+                preflight_ixs,
+                &[&proposer],
+                Some(&config),
+            )
+            .await
+            .unwrap_err();
 
-        assert!(matches!(err, SquadsError::ProposerNotMember { .. }));
-        // No transaction should have been submitted.
-        assert!(mock.sent_transactions().is_empty());
+            assert!(matches!(err, SquadsError::ProposerNotMember { .. }));
+            assert!(mock.sent_transactions().is_empty());
+        }
     }
 
     #[test]
